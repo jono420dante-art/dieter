@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dieter-sandbox
+  namespace: dieter
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dieter-sandbox
+  template:
+    metadata:
+      labels:
+        app: dieter-sandbox
+    spec:
+      containers:
+      - name: sandbox
+        image: python:3.11-slim
+        ports:
+        - containerPort: 5000
+        env:
+        - name: SANDBOX_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: dieter-secrets
+              key: SANDBOX_API_KEY
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: sandbox-data
+          mountPath: /sandbox
+        securityContext:
+          runAsNonRoot: true
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+      volumes:
+      - name: sandbox-data
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dieter-sandbox
+  namespace: dieter
+spec:
+  selector:
+    app: dieter-sandbox
+  ports:
+  - protocol: TCP
+    port: 5000
+    targetPort: 5000
+  type: ClusterIP

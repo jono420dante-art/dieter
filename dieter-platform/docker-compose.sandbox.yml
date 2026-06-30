@@ -1,0 +1,43 @@
+version: '3.9'
+
+services:
+  # Sandbox execution environment
+  sandbox:
+    image: python:3.11-slim
+    container_name: dieter-sandbox
+    environment:
+      SANDBOX_API_KEY: ${SANDBOX_API_KEY:-sandbox-key-change-in-production}
+    ports:
+      - "5000:5000"
+    volumes:
+      - sandbox_data:/sandbox
+      - ./services/sandbox:/app
+    working_dir: /app
+    command: python -m uvicorn server:app --host 0.0.0.0 --port 5000
+    networks:
+      - dieter-net
+    restart: unless-stopped
+
+  # Execution engine
+  executor:
+    image: python:3.11
+    container_name: dieter-executor
+    environment:
+      SANDBOX_PROXY_URL: http://sandbox:5000
+      DATABASE_URL: postgresql://${DB_USER:-dieter}:${DB_PASSWORD:-dieter}@postgres:5432/${DB_NAME:-dieter}
+    volumes:
+      - ./services/executor:/app
+    working_dir: /app
+    command: python -m uvicorn app:app --host 0.0.0.0 --port 5001
+    ports:
+      - "5001:5001"
+    depends_on:
+      - sandbox
+      - postgres
+    networks:
+      - dieter-net
+    restart: unless-stopped
+
+volumes:
+  sandbox_data:
+    driver: local
