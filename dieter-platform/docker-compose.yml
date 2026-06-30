@@ -1,0 +1,261 @@
+version: '3.9'
+
+services:
+  # ========================================================================
+  # POSTGRES DATABASE
+  # ========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: dieter-postgres
+    environment:
+      POSTGRES_USER: dieter
+      POSTGRES_PASSWORD: dieter
+      POSTGRES_DB: dieter
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dieter"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dieter-net
+    restart: unless-stopped
+
+  # ========================================================================
+  # REDIS CACHE & QUEUE
+  # ========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: dieter-redis
+    command: redis-server --appendonly yes --requirepass ""
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dieter-net
+    restart: unless-stopped
+
+  # ========================================================================
+  # OLLAMA (Local LLM - Optional, for development/free tier)
+  # ========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: dieter-ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - dieter-net
+    restart: unless-stopped
+    profiles:
+      - ollama
+    # To use: docker-compose --profile ollama up ollama
+    # Then: docker-compose exec ollama ollama pull mistral
+
+  # ========================================================================
+  # FASTAPI BACKEND
+  # ========================================================================
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+    container_name: dieter-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      - DATABASE_URL=postgresql://dieter:dieter@postgres:5432/dieter
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET=${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - EMAIL_PROVIDER=${EMAIL_PROVIDER:-resend}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - POSTMARK_API_KEY=${POSTMARK_API_KEY:-}
+      - SENDGRID_API_KEY=${SENDGRID_API_KEY:-}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-pielanie420@gmail.com}
+      - EMAIL_FROM_ADDRESS=${EMAIL_FROM_ADDRESS:-noreply@dieter.local}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - OLLAMA_BASE_URL=http://ollama:11434
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/api:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - dieter-net
+    restart: unless-stopped
+
+  # ========================================================================
+  # PUBLIC WEB (Next.js - Lead capture, public feedback)
+  # ========================================================================
+  public-web:
+    build:
+      context: ./apps/public-web
+      dockerfile: Dockerfile
+    container_name: dieter-public-web
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NODE_ENV=development
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./apps/public-web:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - api
+    networks:
+      - dieter-net
+    restart: unless-stopped
+
+  # ========================================================================
+  # OPERATOR WEB (Next.js - Dashboard, internal operations)
+  # ========================================================================
+  operator-web:
+    build:
+      context: ./apps/operator-web
+      dockerfile: Dockerfile
+    container_name: dieter-operator-web
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NODE_ENV=development
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./apps/operator-web:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - api
+    networks:
+      - dieter-net
+    restart: unless-stopped
+
+  # ========================================================================
+  # WORKER (Celery/Redis - Background jobs, email scheduling)
+  # ========================================================================
+  worker:
+    build:
+      context: ./apps/worker
+      dockerfile: Dockerfile
+    container_name: dieter-worker
+    command: celery -A app.worker worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql://dieter:dieter@postgres:5432/dieter
+      - REDIS_URL=redis://redis:6379/1
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - EMAIL_PROVIDER=${EMAIL_PROVIDER:-resend}
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-pielanie420@gmail.com}
+    volumes:
+      - ./apps/worker:/app
+    depends_on:
+      - postgres
+      - redis
+      - api
+    networks:
+      - dieter-net
+    restart: unless-stopped
+
+  # ========================================================================
+  # PROMETHEUS (Metrics collection)
+  # ========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: dieter-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - dieter-net
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    # To use: docker-compose --profile monitoring up prometheus
+
+  # ========================================================================
+  # GRAFANA (Dashboards)
+  # ========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: dieter-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+    ports:
+      - "3002:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - dieter-net
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  # ========================================================================
+  # PGADMIN (Database UI - Optional)
+  # ========================================================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: dieter-pgadmin
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@dieter.local
+      - PGADMIN_DEFAULT_PASSWORD=admin
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - dieter-net
+    restart: unless-stopped
+    profiles:
+      - dev-tools
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  ollama_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+networks:
+  dieter-net:
+    driver: bridge
