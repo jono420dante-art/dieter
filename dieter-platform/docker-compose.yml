@@ -8,17 +8,17 @@ services:
     image: postgres:16-alpine
     container_name: dieter-postgres
     environment:
-      POSTGRES_USER: dieter
-      POSTGRES_PASSWORD: dieter
-      POSTGRES_DB: dieter
+      POSTGRES_USER: ${DB_USER:-dieter}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-dieter}
+      POSTGRES_DB: ${DB_NAME:-dieter}
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     ports:
-      - "5432:5432"
+      - "${DB_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dieter"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-dieter}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -27,18 +27,21 @@ services:
     restart: unless-stopped
 
   # ========================================================================
-  # REDIS CACHE & QUEUE
+  # REDIS CACHE & QUEUE (with authentication)
   # ========================================================================
   redis:
     image: redis:7-alpine
     container_name: dieter-redis
-    command: redis-server --appendonly yes --requirepass ""
+    command: >
+      redis-server 
+      --requirepass ${REDIS_PASSWORD:-redis-dev-password-change-in-production}
+      --appendonly yes
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis-dev-password-change-in-production}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -63,8 +66,6 @@ services:
     restart: unless-stopped
     profiles:
       - ollama
-    # To use: docker-compose --profile ollama up ollama
-    # Then: docker-compose exec ollama ollama pull mistral
 
   # ========================================================================
   # FASTAPI BACKEND
@@ -76,24 +77,35 @@ services:
       args:
         BUILDKIT_INLINE_CACHE: 1
     container_name: dieter-api
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: >
+      sh -c "python -m uvicorn app.main:app 
+      --host 0.0.0.0 
+      --port ${API_PORT:-8000}
+      $( [ '${ENVIRONMENT:-development}' = 'development' ] && echo '--reload' || echo '' )"
     environment:
-      - DATABASE_URL=postgresql://dieter:dieter@postgres:5432/dieter
-      - REDIS_URL=redis://redis:6379/0
-      - JWT_SECRET=${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
-      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
-      - EMAIL_PROVIDER=${EMAIL_PROVIDER:-resend}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - RESEND_API_KEY=${RESEND_API_KEY:-}
-      - POSTMARK_API_KEY=${POSTMARK_API_KEY:-}
-      - SENDGRID_API_KEY=${SENDGRID_API_KEY:-}
-      - ADMIN_EMAIL=${ADMIN_EMAIL:-pielanie420@gmail.com}
-      - EMAIL_FROM_ADDRESS=${EMAIL_FROM_ADDRESS:-noreply@dieter.local}
-      - ENVIRONMENT=${ENVIRONMENT:-development}
-      - OLLAMA_BASE_URL=http://ollama:11434
+      DATABASE_URL: postgresql://${DB_USER:-dieter}:${DB_PASSWORD:-dieter}@postgres:5432/${DB_NAME:-dieter}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password-change-in-production}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis-dev-password-change-in-production}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis-dev-password-change-in-production}@redis:6379/2
+      JWT_SECRET: ${JWT_SECRET:?error: JWT_SECRET not set - generate strong secret for production}
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-resend}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      POSTMARK_API_KEY: ${POSTMARK_API_KEY:-}
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-ops@dieter.internal}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-noreply@dieter.internal}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-DIETER}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:3001}
+      ALLOW_ORIGINS_ANY: ${ALLOW_ORIGINS_ANY:-false}
+      OLLAMA_BASE_URL: http://ollama:11434
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:8000}
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:${API_PORT:-8000}"
     volumes:
       - ./apps/api:/app
     depends_on:
@@ -114,8 +126,9 @@ services:
       dockerfile: Dockerfile
     container_name: dieter-public-web
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
-      - NODE_ENV=development
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      NEXT_PRIVATE_API_URL: http://api:8000
+      NODE_ENV: ${NODE_ENV:-development}
     ports:
       - "3000:3000"
     volumes:
@@ -137,8 +150,9 @@ services:
       dockerfile: Dockerfile
     container_name: dieter-operator-web
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
-      - NODE_ENV=development
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      NEXT_PRIVATE_API_URL: http://api:8000
+      NODE_ENV: ${NODE_ENV:-development}
     ports:
       - "3001:3000"
     volumes:
@@ -159,21 +173,26 @@ services:
       context: ./apps/worker
       dockerfile: Dockerfile
     container_name: dieter-worker
-    command: celery -A app.worker worker --loglevel=info
+    command: celery -A app.worker worker --loglevel=info --concurrency=4
     environment:
-      - DATABASE_URL=postgresql://dieter:dieter@postgres:5432/dieter
-      - REDIS_URL=redis://redis:6379/1
-      - CELERY_BROKER_URL=redis://redis:6379/1
-      - CELERY_RESULT_BACKEND=redis://redis:6379/2
-      - EMAIL_PROVIDER=${EMAIL_PROVIDER:-resend}
-      - RESEND_API_KEY=${RESEND_API_KEY:-}
-      - ADMIN_EMAIL=${ADMIN_EMAIL:-pielanie420@gmail.com}
+      DATABASE_URL: postgresql://${DB_USER:-dieter}:${DB_PASSWORD:-dieter}@postgres:5432/${DB_NAME:-dieter}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis-dev-password-change-in-production}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis-dev-password-change-in-production}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis-dev-password-change-in-production}@redis:6379/2
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-resend}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      POSTMARK_API_KEY: ${POSTMARK_API_KEY:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-ops@dieter.internal}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
     volumes:
       - ./apps/worker:/app
     depends_on:
-      - postgres
-      - redis
-      - api
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
     networks:
       - dieter-net
     restart: unless-stopped
@@ -187,8 +206,6 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
     ports:
       - "9090:9090"
     volumes:
@@ -199,17 +216,16 @@ services:
     restart: unless-stopped
     profiles:
       - monitoring
-    # To use: docker-compose --profile monitoring up prometheus
 
   # ========================================================================
-  # GRAFANA (Dashboards)
+  # GRAFANA (Dashboards) - SECURED
   # ========================================================================
   grafana:
     image: grafana/grafana:latest
     container_name: dieter-grafana
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_SECURITY_ADMIN_USER=admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?error: GRAFANA_PASSWORD not set}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
     ports:
       - "3002:3000"
     volumes:
@@ -224,14 +240,14 @@ services:
       - monitoring
 
   # ========================================================================
-  # PGADMIN (Database UI - Optional)
+  # PGADMIN (Database UI - Optional) - SECURED
   # ========================================================================
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: dieter-pgadmin
     environment:
-      - PGADMIN_DEFAULT_EMAIL=admin@dieter.local
-      - PGADMIN_DEFAULT_PASSWORD=admin
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:?error: PGADMIN_EMAIL not set}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:?error: PGADMIN_PASSWORD not set}
     ports:
       - "5050:80"
     volumes:
